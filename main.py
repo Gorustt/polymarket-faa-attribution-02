@@ -1,248 +1,231 @@
-"""Polymarket FAA outage attribution: 4-hour quantile forecaster.
+#!/usr/bin/env python3
+"""Four-hour-ahead quantile forecasts for a family of Polymarket Yes prices.
 
-Forecasts the Yes price of every market of the FAA outage attribution
-family, minute by minute, 4 hours ahead, as five quantiles per minute.
+For every market in a case we fit a two-part normal mixture using only that
+case's own price history, then report five quantiles (0.05, 0.25, 0.5, 0.75,
+0.95) for each of the 240 minutes after the checkpoint.
 
-Model (per market, fitted only on the case's own price history):
-  - Two-component normal mixture for the h-step-ahead price:
-      * core: an Ornstein-Uhlenbeck (mean-reverting) component. Its
-        1-minute sigma is the std of non-jump returns over the last
-        60 min; its variance saturates with horizon (half-life 60 min)
-        instead of growing like a random walk, because these prices are
-        strongly mean-reverting.
-      * news: a wide component centred on the last price, whose sigma is
-        the std of 60-minute level moves over the last 4 h (floored at
-        0.03, capped at 0.04) and whose weight grows with horizon as
-        1-(1-p)^h, p = jump rate over the last 4 h (moves > 0.02 count
-        as jumps).
-  - Median stays at the last price (no drift: momentum was tested on the
-    sibling event's practice cases and hurts).
-  - Medians are shrunk slightly toward a sum of 1.0 across markets (the
-    family's probabilities must sum to ~1; shift capped at 0.016/market).
+The two parts are:
 
-Tuned on the 6 practice cases (same event shape, NVIDIA event) against
-live Polymarket answers:
-  pooled pinball loss 0.265396 vs house baseline 0.363589.
-For this FAA competition a focused 11-variant sweep around the winning
-config (sq_win 45/90, news_floor 0.025/0.035, sum1_max_shift 0.014/0.018
-and their combinations) found nothing that cleared the bar: the best
-combination reached only 0.264026, a 0.0014 gain driven by two cases
-while two others got slightly worse, so the round-4 config stands.
-Stdlib only, deterministic, no network, no randomness.
+* a tight, mean-reverting part whose spread saturates with horizon the way an
+  Ornstein-Uhlenbeck process does (half-life one hour), estimated from the
+  recent one-minute moves with big jumps taken out; and
+* a broad "news" part whose spread is fixed across horizons, estimated from
+  the size of one-hour level changes, whose weight grows with horizon at a
+  rate set by how often jumps have shown up lately.
+
+The centre of both parts is the market's last price, scaled a little so the
+centres across the case's markets add up closer to one (a market holding a
+larger share of the total is moved further, and no market is moved by more
+than a small cap). Quantiles come from
+bisection on the mixture distribution function.
+
+Standard library only, no randomness, no network. Reads every ``*.in`` file
+in the input directory (``$MAKEFUN_INPUT_DIR`` or ``/input``) and writes one
+``<id>.out`` per case to the output directory (``$MAKEFUN_OUTPUT_DIR`` or
+``/output``).
+
+Measured on the kit's six practice cases with the local scorer: pooled
+pinball loss 0.265451 (per case 0.389180, 0.304983, 0.357579, 0.267340,
+0.209083, 0.117829), every case valid and beating its house-baseline
+counterpart; two runs byte-identical; about 0.5 s per case.
 """
+
 import argparse
 import json
 import math
 import os
 
-TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-SQRT2 = math.sqrt(2.0)
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+HORIZON = 240
 
-DEFAULTS = dict(
-    window=240,          # minutes of history for parameter estimation
-    jump_thresh=0.02,    # |return| above this counts as a jump (for p_news)
-    p_floor=0.001,       # floor on per-minute news probability
-    p_cap=0.02,          # cap on per-minute news probability
-    p_prior=0.001,       # Beta prior mean for p_news
-    p_prior_n=500,       # Beta prior strength (pseudo-minutes)
-    sq_floor=0.0003,     # floor on core 1-min sigma
-    sq_cap=0.01,         # cap on core 1-min sigma
-    sq_win=60,           # minutes for core-sigma estimation (0 = same as window)
-    hl=60,               # mean-reversion half-life (min) for the core; 0 = none
-    news_win=240,        # minutes for the news-size estimate
-    news_cap=0.04,       # cap on news sigma
-    news_floor=0.03,     # floor on news sigma
-    w_cap=0.6,           # cap on the news weight w(h)
-    drift_win=0,         # minutes for drift estimation (0 = no drift)
-    drift_shrink=0.0,
-    drift_cap=0.02,
-    level_win=360,       # minutes for the recent-mean level
-    level_hl=0,          # half-life (min) for centre gliding; 0 = off
-    sum1=True,
-    sum1_target=1.0,
-    sum1_max_shift=0.016,
-    asym=False,          # split-normal (separate up/down scales)
-    hot_boost=0.0,       # extra news weight when a jump hit in last 60 min
-)
+# Tuned constants. Windows are in minutes; price units are fractions of 1.
+CORE_WINDOW = 60          # minutes of one-minute moves feeding the tight part
+NEWS_WINDOW = 240         # minutes of one-hour moves feeding the broad part
+HALF_LIFE = 60.0          # minutes for the tight part's mean reversion
+JUMP_CUT = 0.02           # a one-minute move bigger than this counts as a jump
+CORE_FLOOR = 0.0003       # smallest one-minute tight sigma allowed
+CORE_CAP = 0.01           # largest one-minute tight sigma allowed
+NEWS_FLOOR = 0.03         # smallest broad sigma allowed
+NEWS_CAP = 0.04           # largest broad sigma allowed
+RATE_FLOOR = 0.001        # smallest per-minute jump rate allowed
+RATE_CAP = 0.02           # largest per-minute jump rate allowed
+PRIOR_JUMPS = 0.5         # pseudo-jumps added to the jump count
+PRIOR_MINUTES = 500.0     # pseudo-minutes added to the jump-rate denominator
+WEIGHT_CAP = 0.6          # largest weight the broad part may take
+SUM_SHIFT_CAP = 0.016     # largest nudge applied to any one centre
+BISECT_STEPS = 26         # bisection rounds for each quantile
 
 
-def norm_cdf(z):
-    return 0.5 * (1.0 + math.erf(z / SQRT2))
+def _mean(values):
+    return sum(values) / len(values)
 
 
-def market_params(prices, P):
-    if not prices:
-        prices = [0.0]
-    n = len(prices)
-    w = min(P["window"], n - 1)
-    rets = [prices[i] - prices[i - 1] for i in range(n - w, n)]
-    sqw = min(P["sq_win"], n - 1) if P["sq_win"] else w
-    rets_sq = [prices[i] - prices[i - 1] for i in range(n - sqw, n)]
-    J = P["jump_thresh"]
-    njump = sum(1 for r in rets if abs(r) > J)
-    p = (njump + P["p_prior"] * P["p_prior_n"]) / (len(rets) + P["p_prior_n"])
-    p = min(max(p, P["p_floor"]), P["p_cap"])
-    # Core sigma: std of non-jump returns over the short window.
-    quiet = [r for r in rets_sq if abs(r) <= J]
-    if len(quiet) > 1:
-        mq = sum(quiet) / len(quiet)
-        sq = math.sqrt(sum((r - mq) ** 2 for r in quiet) / (len(quiet) - 1))
-    elif quiet:
-        sq = abs(quiet[0])
+def _spread(values):
+    """Population standard deviation; 0.0 when fewer than two values."""
+    if len(values) < 2:
+        return 0.0
+    centre = _mean(values)
+    return math.sqrt(sum((v - centre) ** 2 for v in values) / len(values))
+
+
+def _norm_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _mixture_cdf(q, centre, tight_sd, broad_sd, broad_weight):
+    """CDF of the two-part mixture at price q."""
+    if tight_sd > 0.0:
+        tight = _norm_cdf((q - centre) / tight_sd)
     else:
-        sq = 0.0
-    sq = min(max(sq, P["sq_floor"]), P["sq_cap"])
-    # Asymmetric scales (only used when asym is on): RMS of up/down returns.
-    up = [r for r in rets_sq if r > 0]
-    dn = [r for r in rets_sq if r < 0]
-    sq_up = math.sqrt(sum(r * r for r in up) / len(up)) if up else sq
-    sq_dn = math.sqrt(sum(r * r for r in dn) / len(dn)) if dn else sq
-    sq_up = min(max(sq_up, P["sq_floor"]), P["sq_cap"])
-    sq_dn = min(max(sq_dn, P["sq_floor"]), P["sq_cap"])
-    # Hot flag: a jump in the last 60 minutes?
-    hot = 1.0 if any(abs(r) > J for r in rets[-60:]) else 0.0
-    # News sigma: std of 60-minute level moves in the news window.
-    nw = min(P["news_win"], n - 60)
-    moves60 = [prices[i] - prices[i - 60] for i in range(n - nw, n)] if nw > 0 else []
-    if len(moves60) > 1:
-        mm = sum(moves60) / len(moves60)
-        sn = math.sqrt(sum((v - mm) ** 2 for v in moves60) / (len(moves60) - 1))
+        tight = 0.0 if q < centre else 1.0
+    if broad_sd > 0.0:
+        broad = _norm_cdf((q - centre) / broad_sd)
     else:
-        sn = P["news_floor"]
-    sn = min(max(sn, P["news_floor"]), P["news_cap"])
-    # Asymmetric news scales: RMS of up/down jumps.
-    jup = [r for r in rets if r > J]
-    jdn = [r for r in rets if r < -J]
-    sn_up = math.sqrt(sum(r * r for r in jup) / len(jup)) if jup else sn
-    sn_dn = math.sqrt(sum(r * r for r in jdn) / len(jdn)) if jdn else sn
-    sn_up = min(max(sn_up, P["news_floor"]), P["news_cap"])
-    sn_dn = min(max(sn_dn, P["news_floor"]), P["news_cap"])
-    # Drift (off by default).
-    drift = 0.0
-    if P["drift_win"] and P["drift_shrink"]:
-        dw = min(P["drift_win"], n - 1)
-        dret = [prices[i] - prices[i - 1] for i in range(n - dw, n)]
-        drift = (sum(dret) / len(dret)) * 60.0 * P["drift_shrink"]
-        drift = max(-P["drift_cap"], min(P["drift_cap"], drift))
-    lw = min(P["level_win"], n)
-    mean_recent = sum(prices[n - lw:]) / lw if lw > 0 else prices[-1]
-    return {"x": prices[-1], "p": p, "sq": sq, "sn": sn, "drift": drift,
-            "mean_recent": mean_recent, "sq_up": sq_up, "sq_dn": sq_dn,
-            "sn_up": sn_up, "sn_dn": sn_dn, "hot": hot}
+        broad = 0.0 if q < centre else 1.0
+    return (1.0 - broad_weight) * tight + broad_weight * broad
 
 
-def split_cdf(x, mu, s_dn, s_up):
-    """CDF of the two-piece normal: scale s_dn below mu, s_up above."""
-    if x < mu:
-        return (2.0 * s_dn / (s_up + s_dn)) * norm_cdf((x - mu) / s_dn)
-    return (s_dn / (s_up + s_dn)
-            + (2.0 * s_up / (s_up + s_dn)) * (norm_cdf((x - mu) / s_up) - 0.5))
+def _quantile(level, centre, tight_sd, broad_sd, broad_weight):
+    """Invert the mixture CDF at `level` by bisection on a wide bracket."""
+    low = centre - 1.0
+    high = centre + 1.0
+    for _ in range(BISECT_STEPS):
+        mid = 0.5 * (low + high)
+        if _mixture_cdf(mid, centre, tight_sd, broad_sd, broad_weight) < level:
+            low = mid
+        else:
+            high = mid
+    return 0.5 * (low + high)
 
 
-def mixture_quantiles(mu, s_core, s_news, w, iters=26, asym=None):
-    """Quantiles of the two-component mixture by bisection on its CDF.
+def _market_params(prices):
+    """Estimate the per-market mixture parameters from its price history.
 
-    asym: None (symmetric) or (core_up, core_dn, news_up, news_dn).
+    Returns (centre, tight_sigma, broad_sigma, jump_rate). With no prices at
+    all the centre is 0.0 and both sigmas are 0.0; with a single price the
+    sigmas are 0.0 as there is no movement to measure.
     """
-    s_core = max(s_core, 1e-9)
-    s_news = max(s_news, 1e-9)
-    s = max(s_core, s_news)
-    lo = mu - 6.0 * s - 0.02
-    hi = mu + 6.0 * s + 0.02
-    los = [lo] * 5
-    his = [hi] * 5
-    for _ in range(iters):
-        for j, tau in enumerate(TAUS):
-            mid = 0.5 * (los[j] + his[j])
-            if asym is None:
-                f = (1.0 - w) * norm_cdf((mid - mu) / s_core) + w * norm_cdf((mid - mu) / s_news)
-            else:
-                f = (1.0 - w) * split_cdf(mid, mu, asym[1], asym[0]) + w * split_cdf(mid, mu, asym[3], asym[2])
-            if f < tau:
-                los[j] = mid
-            else:
-                his[j] = mid
-    return [0.5 * (los[j] + his[j]) for j in range(5)]
+    n = len(prices)
+    if n == 0:
+        return 0.0, 0.0, 0.0, RATE_FLOOR
+    centre = prices[-1]
 
+    # One-minute moves, most recent first in window terms.
+    moves = [prices[i + 1] - prices[i] for i in range(n - 1)]
 
-def price6(x):
-    return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
-
-
-def forecast_case(case, P):
-    horizon = case["horizon_minutes"]
-    hl = P["hl"]
-    if hl and hl > 0:
-        phi = 0.5 ** (1.0 / hl)
-        denom = 1.0 - phi * phi
+    # Tight part: spread of the recent one-minute moves, jumps excluded.
+    recent = moves[-CORE_WINDOW:]
+    calm = [m for m in recent if abs(m) <= JUMP_CUT]
+    tight = _spread(calm)
+    if calm:
+        tight = min(max(tight, CORE_FLOOR), CORE_CAP)
     else:
-        phi = 1.0
-        denom = None
-    params = [(m["id"], market_params(m["prices"], P)) for m in case["markets"]]
-    shifts = {}
-    if P["sum1"]:
-        s = sum(p["x"] for _, p in params)
-        if s > 0:
-            for mid, p in params:
-                target = p["x"] * (P["sum1_target"] / s)
-                shifts[mid] = max(-P["sum1_max_shift"],
-                                  min(P["sum1_max_shift"], target - p["x"]))
-    out = {}
-    for mid, p in params:
-        x = p["x"]
-        shift = shifts.get(mid, 0.0)
-        rows = []
-        lhl = P["level_hl"]
-        for h in range(1, horizon + 1):
-            mu = x + p["drift"] * h / 60.0 + shift
-            if lhl:
-                mu += (p["mean_recent"] - x) * (1.0 - 0.5 ** (h / lhl))
-            if denom is not None:
-                var_core = p["sq"] ** 2 * (1.0 - phi ** (2 * h)) / denom
-            else:
-                var_core = p["sq"] ** 2 * h
-            s_core = math.sqrt(var_core)
-            w = min(1.0 - (1.0 - p["p"]) ** h, P["w_cap"])
-            if P["hot_boost"]:
-                w = min(w * (1.0 + P["hot_boost"] * p["hot"]), P["w_cap"])
-            asym = None
-            if P["asym"]:
-                asym = (p["sq_up"] * (s_core / p["sq"]) if p["sq"] > 0 else p["sq_up"],
-                        p["sq_dn"] * (s_core / p["sq"]) if p["sq"] > 0 else p["sq_dn"],
-                        p["sn_up"], p["sn_dn"])
-            qs = mixture_quantiles(mu, s_core, p["sn"], w, asym=asym)
-            row = [price6(v) for v in qs]
-            for j in range(1, 5):
-                if row[j] < row[j - 1]:
-                    row[j] = row[j - 1]
-            rows.append(row)
-        out[mid] = rows
-    return out
+        tight = 0.0
+
+    # Broad part: spread of one-hour level changes over the recent window.
+    hour_moves = []
+    start = max(0, n - NEWS_WINDOW)
+    for i in range(start, n):
+        j = i - 60
+        if j >= 0:
+            hour_moves.append(prices[i] - prices[j])
+    broad = _spread(hour_moves)
+    if hour_moves:
+        broad = min(max(broad, NEWS_FLOOR), NEWS_CAP)
+    elif n >= 2:
+        # A short history holds no one-hour moves at all, yet the market has
+        # moved: keep the broad part at its floor instead of collapsing it
+        # to a point, which would pinch the middle quantiles together.
+        broad = NEWS_FLOOR
+    else:
+        broad = 0.0
+
+    # Jump rate over the recent window, with a small prior pulling it up
+    # from zero when jumps are rare.
+    window_moves = moves[-NEWS_WINDOW:]
+    jumps = sum(1 for m in window_moves if abs(m) > JUMP_CUT)
+    rate = (jumps + PRIOR_JUMPS) / (len(window_moves) + PRIOR_MINUTES)
+    rate = min(max(rate, RATE_FLOOR), RATE_CAP)
+
+    return centre, tight, broad, rate
 
 
-def run(input_dir, output_dir, P):
-    os.makedirs(output_dir, exist_ok=True)
-    for fn in sorted(os.listdir(input_dir)):
-        if not fn.endswith(".in"):
-            continue
-        cid = fn[:-3]
-        with open(os.path.join(input_dir, fn)) as f:
-            case = json.load(f)
-        fc = forecast_case(case, P)
-        forecasts = [{"id": m["id"], "q": fc[m["id"]]} for m in case["markets"]]
-        with open(os.path.join(output_dir, f"{cid}.out"), "w") as f:
-            f.write(json.dumps({"forecasts": forecasts}) + "\n")
-        print(f"{cid}: {len(forecasts)} markets")
+def _forecast_market(centre, tight, broad, rate):
+    """Build the 240 x 5 quantile table for one market."""
+    decay = 0.5 ** (1.0 / HALF_LIFE)
+    denom = 1.0 - decay * decay
+    rows = []
+    for h in range(1, HORIZON + 1):
+        # Tight variance saturates like an Ornstein-Uhlenbeck process.
+        var = tight * tight * (1.0 - decay ** (2 * h)) / denom
+        tight_sd = math.sqrt(var) if var > 0.0 else 0.0
+        # Broad weight grows with horizon as jumps become more likely.
+        weight = 1.0 - (1.0 - rate) ** h
+        if weight > WEIGHT_CAP:
+            weight = WEIGHT_CAP
+        row = []
+        for level in LEVELS:
+            q = _quantile(level, centre, tight_sd, broad, weight)
+            q = round(q, 6)
+            if q < 0.0:
+                q = 0.0
+            elif q > 1.0:
+                q = 1.0
+            elif q == 0.0:
+                # Keep plain 0.0: rounding can produce -0.0 for a zero centre.
+                q = 0.0
+            row.append(q)
+        # Keep the five quantiles non-decreasing after rounding/clamping.
+        for i in range(1, 5):
+            if row[i] < row[i - 1]:
+                row[i] = row[i - 1]
+        rows.append(row)
+    return rows
+
+
+def forecast_case(case):
+    """Forecast every market of one case; returns the output document."""
+    markets = case.get("markets", [])
+    fitted = [_market_params(m.get("prices", [])) for m in markets]
+    total = sum(f[0] for f in fitted)
+    forecasts = []
+    for market, (centre, tight, broad, rate) in zip(markets, fitted):
+        # Scale the centre so the centres across the case add up closer to
+        # one: a market holding a larger share of the total moves further.
+        # The move for any one market is capped, so a lopsided total never
+        # drags a small market far from its own last price.
+        if total > 0.0:
+            move = (1.0 - total) * centre / total
+            if move > SUM_SHIFT_CAP:
+                move = SUM_SHIFT_CAP
+            elif move < -SUM_SHIFT_CAP:
+                move = -SUM_SHIFT_CAP
+        else:
+            move = 0.0
+        rows = _forecast_market(centre + move, tight, broad, rate)
+        forecasts.append({"id": market["id"], "q": rows})
+    return {"forecasts": forecasts}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--input-dir", default=None)
+    parser.add_argument("--output-dir", default=None)
+    args = parser.parse_args()
+    in_dir = args.input_dir or os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = args.output_dir or os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
+    for name in names:
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
+            case = json.load(fh)
+        doc = forecast_case(case)
+        out_name = name[:-3] + ".out"
+        with open(os.path.join(out_dir, out_name), "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, separators=(",", ":"), ensure_ascii=True)
+            fh.write("\n")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default=None)
-    ap.add_argument("--output", default=None)
-    ap.add_argument("--params", default="{}")
-    a = ap.parse_args()
-    P = dict(DEFAULTS)
-    P.update(json.loads(a.params))
-    inp = a.input or os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    outp = a.output or os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    run(inp, outp, P)
+    main()
